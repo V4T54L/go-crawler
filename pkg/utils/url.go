@@ -22,4 +22,3 @@ func ToAbsoluteURL(base *url.URL, relative string) (string, error) {
 	}
 	return base.ResolveReference(relURL).String(), nil
 }
-```

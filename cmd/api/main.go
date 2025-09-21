@@ -12,15 +12,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-redis/redis/v9" // Changed from github.com/redis/go-redis/v9
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp" // Kept for /metrics endpoint
+	"github.com/redis/go-redis/v9"                            // Changed from github.com/redis/go-redis/v9
 
 	"github.com/user/crawler-service/internal/adapter/chromedp_crawler"
 	"github.com/user/crawler-service/internal/adapter/postgres" // Changed import alias
 	redis_adapter "github.com/user/crawler-service/internal/adapter/redis"
-	http_delivery "github.com/user/crawler-service/internal/delivery/http" // Changed import alias
-	"github.com/user/crawler-service/internal/repository"                 // Added for QueueRepository in metrics collector
+	http_delivery "github.com/user/crawler-service/internal/delivery/http/handler" // Changed import alias
+	"github.com/user/crawler-service/internal/repository"                          // Added for QueueRepository in metrics collector
 	"github.com/user/crawler-service/internal/usecase"
 	"github.com/user/crawler-service/pkg/config"
 	"github.com/user/crawler-service/pkg/logger"
@@ -90,15 +90,15 @@ func main() {
 	urlManager := usecase.NewURLManager(visitedRepo, queueRepo, extractedDataRepo, failedURLRepo)
 	// The crawler use case would be run by background workers.
 	// For the API, we only need the URL manager.
-	// _ = usecase.NewCrawlerUseCase(queueRepo, crawlerRepo, extractedDataRepo, failedURLRepo) // Commented out as per attempted content
-	slog.Info("URL Manager use case initialized") // Updated log message
+	_ = usecase.NewCrawlerUseCase(queueRepo, crawlerRepo, extractedDataRepo, failedURLRepo) // Commented out as per attempted content
+	slog.Info("URL Manager use case initialized")                                           // Updated log message
 
 	// --- Start Background Services ---
 	go startQueueMetricsCollector(ctx, queueRepo) // Added from attempted content
 
 	// --- HTTP Server ---
 	apiHandler := http_delivery.NewHandler(urlManager) // Use http_delivery
-	httpRouter := http_delivery.New(apiHandler)        // Use http_delivery
+	// httpRouter := http_delivery.New(apiHandler)        // Use http_delivery
 
 	// Add Prometheus metrics handler
 	http.Handle("/metrics", promhttp.Handler())
@@ -106,8 +106,8 @@ func main() {
 
 	server := &http.Server{
 		Addr:         net.JoinHostPort("", cfg.ServerPort), // Use net.JoinHostPort
-		Handler:      http.DefaultServeMux,                  // Use DefaultServeMux to handle both router and metrics
-		ReadTimeout:  10 * time.Second,                      // Adopted from attempted content
+		Handler:      http.DefaultServeMux,                 // Use DefaultServeMux to handle both router and metrics
+		ReadTimeout:  10 * time.Second,                     // Adopted from attempted content
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second, // Kept from original
 	}
@@ -156,4 +156,3 @@ func startQueueMetricsCollector(ctx context.Context, queueRepo repository.QueueR
 		}
 	}
 }
-

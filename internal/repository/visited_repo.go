@@ -14,4 +14,3 @@ type VisitedRepository interface {
 	// RemoveVisited removes a URL from the visited set, used for force_crawl.
 	RemoveVisited(ctx context.Context, url string) error
 }
-```

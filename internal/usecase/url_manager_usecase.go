@@ -93,19 +93,21 @@ func (uc *urlManagerUseCase) GetStatus(ctx context.Context, url string) (*entity
 	// For now, we'll assume this check is part of a more complete repo.
 	// Let's add a placeholder for this logic.
 	// For this step, we'll skip the failed check as the repo doesn't have FindByURL.
-	failedURL, err := uc.failedURLRepo.FindByURL(ctx, url) // Assuming this method exists now
-	if err == nil && failedURL != nil {
-		status := "failed"
-		if failedURL.NextRetryAt.After(time.Now()) {
-			status = "retrying"
-		}
-		return &entity.CrawlStatus{
-			URL:           url,
-			CurrentStatus: status,
-			NextRetryAt:   &failedURL.NextRetryAt,
-			FailureReason: failedURL.FailureReason,
-		}, nil
-	}
+	// ---------------------------------------
+	// ---------------------------------------
+	// failedURL, err := uc.failedURLRepo.FindByURL(ctx, url) // Assuming this method exists now
+	// if err == nil && failedURL != nil {
+	// 	status := "failed"
+	// 	if failedURL.NextRetryAt.After(time.Now()) {
+	// 		status = "retrying"
+	// 	}
+	// 	return &entity.CrawlStatus{
+	// 		URL:           url,
+	// 		CurrentStatus: status,
+	// 		NextRetryAt:   &failedURL.NextRetryAt,
+	// 		FailureReason: failedURL.FailureReason,
+	// 	}, nil
+	// }
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err // Actual DB error
 	}

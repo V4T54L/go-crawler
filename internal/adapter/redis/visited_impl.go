@@ -3,9 +3,10 @@ package redis
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"github.com/redis/go-redis/v9"
 	"github.com/user/crawler-service/pkg/utils"
-	"time"
 )
 
 const visitedURLPrefix = "visited:"
@@ -29,7 +30,7 @@ func (r *VisitedRepoImpl) generateKey(url string) string {
 func (r *VisitedRepoImpl) MarkVisited(ctx context.Context, url string, expiry time.Duration) error {
 	key := r.generateKey(url)
 	// SETEX is atomic and sets the key with an expiry.
-	return r.client.SetEX(ctx, key, "1", expiry).Err()
+	return r.client.SetEx(ctx, key, "1", expiry).Err()
 }
 
 // IsVisited checks if a URL has been visited recently by checking for the existence of its key.
@@ -49,4 +50,3 @@ func (r *VisitedRepoImpl) RemoveVisited(ctx context.Context, url string) error {
 	// DEL removes the key.
 	return r.client.Del(ctx, key).Err()
 }
-

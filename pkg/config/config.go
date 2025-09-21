@@ -1,7 +1,6 @@
 package config
 
 import (
-	"log"
 	"os"
 	"strconv"
 	"time"
@@ -22,7 +21,7 @@ type Config struct {
 	RedisPassword string
 	RedisDB       int
 
-	MaxConcurrency int
+	MaxConcurrency  int
 	PageLoadTimeout time.Duration
 }
 
@@ -62,4 +61,3 @@ func getEnvAsInt(key string, fallback int) int {
 func getEnvAsDuration(key string, fallback int) time.Duration {
 	return time.Duration(getEnvAsInt(key, fallback))
 }
-
