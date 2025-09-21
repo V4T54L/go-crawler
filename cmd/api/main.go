@@ -2,23 +2,25 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/go-redis/redis/v9" // Changed from github.com/redis/go-redis/v9
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/redis/go-redis/v9"
+	"github.com/prometheus/client_golang/prometheus/promhttp" // Kept for /metrics endpoint
 
 	"github.com/user/crawler-service/internal/adapter/chromedp_crawler"
-	postgres_adapter "github.com/user/crawler-service/internal/adapter/postgres"
+	"github.com/user/crawler-service/internal/adapter/postgres" // Changed import alias
 	redis_adapter "github.com/user/crawler-service/internal/adapter/redis"
-	"github.com/user/crawler-service/internal/delivery/http/handler"
-	"github.com/user/crawler-service/internal/delivery/http/router"
+	http_delivery "github.com/user/crawler-service/internal/delivery/http" // Changed import alias
+	"github.com/user/crawler-service/internal/repository"                 // Added for QueueRepository in metrics collector
 	"github.com/user/crawler-service/internal/usecase"
 	"github.com/user/crawler-service/pkg/config"
 	"github.com/user/crawler-service/pkg/logger"
@@ -41,10 +43,14 @@ func main() {
 	metrics.Init()
 	slog.Info("Metrics initialized")
 
+	// Create a context that is cancelled on interruption signals
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// --- Database Connections ---
-	dbURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
-		cfg.PostgresUser, cfg.PostgresPassword, cfg.PostgresHost, cfg.PostgresPort, cfg.PostgresDB)
-	dbPool, err := pgxpool.New(context.Background(), dbURL)
+	pgConnString := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		cfg.PostgresHost, cfg.PostgresPort, cfg.PostgresUser, cfg.PostgresPassword, cfg.PostgresDB)
+	dbPool, err := pgxpool.New(ctx, pgConnString) // Use ctx for connection
 	if err != nil {
 		slog.Error("Unable to connect to database", "error", err)
 		os.Exit(1)
@@ -57,20 +63,23 @@ func main() {
 		Password: cfg.RedisPassword,
 		DB:       cfg.RedisDB,
 	})
-	if _, err := redisClient.Ping(context.Background()).Result(); err != nil {
+	if err := redisClient.Ping(ctx).Err(); err != nil { // Use ctx for ping
 		slog.Error("Unable to connect to Redis", "error", err)
 		os.Exit(1)
 	}
+	defer redisClient.Close() // Add defer close for redis
 	slog.Info("Successfully connected to Redis")
 
 	// --- Repositories ---
 	visitedRepo := redis_adapter.NewVisitedRepo(redisClient)
 	queueRepo := redis_adapter.NewQueueRepo(redisClient)
-	extractedDataRepo := postgres_adapter.NewExtractedDataRepo(dbPool)
-	failedURLRepo := postgres_adapter.NewFailedURLRepo(dbPool)
+	extractedDataRepo := postgres.NewExtractedDataRepo(dbPool) // Use new postgres adapter
+	failedURLRepo := postgres.NewFailedURLRepo(dbPool)         // Use new postgres adapter
 
 	// Initialize Crawler Repository
-	crawlerRepo, err := chromedp_crawler.NewChromedpCrawler(cfg.MaxConcurrency, cfg.PageLoadTimeout)
+	// For now, no proxies are configured. This can be loaded from config.
+	var proxies []string
+	crawlerRepo, err := chromedp_crawler.NewChromedpCrawler(cfg.MaxConcurrency, cfg.PageLoadTimeout, proxies) // Added proxies argument
 	if err != nil {
 		slog.Error("Failed to initialize Chromedp Crawler", "error", err)
 		os.Exit(1)
@@ -79,51 +88,72 @@ func main() {
 
 	// --- Use Cases ---
 	urlManager := usecase.NewURLManager(visitedRepo, queueRepo, extractedDataRepo, failedURLRepo)
+	// The crawler use case would be run by background workers.
+	// For the API, we only need the URL manager.
+	// _ = usecase.NewCrawlerUseCase(queueRepo, crawlerRepo, extractedDataRepo, failedURLRepo) // Commented out as per attempted content
+	slog.Info("URL Manager use case initialized") // Updated log message
 
-	// Initialize Crawler Use Case
-	// Note: We are not starting the crawler worker here. This is just setting up the components.
-	// A future step will introduce a worker that calls crawlerUseCase.ProcessURLFromQueue in a loop.
-	_ = usecase.NewCrawlerUseCase(queueRepo, crawlerRepo, extractedDataRepo, failedURLRepo)
-	slog.Info("Crawler use case initialized")
+	// --- Start Background Services ---
+	go startQueueMetricsCollector(ctx, queueRepo) // Added from attempted content
 
 	// --- HTTP Server ---
-	apiHandler := handler.NewHandler(urlManager)
-	httpRouter := router.New(apiHandler)
+	apiHandler := http_delivery.NewHandler(urlManager) // Use http_delivery
+	httpRouter := http_delivery.New(apiHandler)        // Use http_delivery
 
 	// Add Prometheus metrics handler
 	http.Handle("/metrics", promhttp.Handler())
-	http.Handle("/", httpRouter)
+	http.Handle("/", httpRouter) // Use the new router
 
 	server := &http.Server{
-		Addr:         ":" + cfg.ServerPort,
-		Handler:      http.DefaultServeMux, // Use DefaultServeMux to handle both router and metrics
-		ReadTimeout:  5 * time.Second,
+		Addr:         net.JoinHostPort("", cfg.ServerPort), // Use net.JoinHostPort
+		Handler:      http.DefaultServeMux,                  // Use DefaultServeMux to handle both router and metrics
+		ReadTimeout:  10 * time.Second,                      // Adopted from attempted content
 		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		IdleTimeout:  120 * time.Second, // Kept from original
 	}
-
-	// --- Graceful Shutdown ---
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		slog.Info("Server is starting", "port", cfg.ServerPort)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) { // Adopted error check
 			slog.Error("Server failed to start", "error", err)
 			os.Exit(1)
 		}
 	}()
 
-	<-stop
+	// --- Graceful Shutdown ---
+	<-ctx.Done() // Use the context from signal.NotifyContext
 	slog.Info("Shutting down server...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Kept original timeout duration
 	defer cancel()
 
-	if err := server.Shutdown(ctx); err != nil {
+	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("Server shutdown failed", "error", err)
 	} else {
 		slog.Info("Server gracefully stopped")
+	}
+}
+
+// startQueueMetricsCollector periodically polls the queue for its size and updates the Prometheus gauge.
+func startQueueMetricsCollector(ctx context.Context, queueRepo repository.QueueRepository) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	slog.Info("Starting queue metrics collector")
+
+	for {
+		select {
+		case <-ticker.C:
+			size, err := queueRepo.Size(context.Background()) // Use background context for short-lived operation
+			if err != nil {
+				slog.Error("Failed to get queue size for metrics", "error", err)
+				continue
+			}
+			metrics.URLsInQueue.Set(float64(size))
+		case <-ctx.Done():
+			slog.Info("Stopping queue metrics collector")
+			return
+		}
 	}
 }
 

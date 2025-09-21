@@ -3,20 +3,23 @@ package usecase
 import (
 	"context"
 	"errors"
+	"fmt" // Added from attempted content
 	"log/slog"
-	"math"
-	"math/rand"
+	"net/url" // Added from attempted content
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/user/crawler-service/internal/entity"
 	"github.com/user/crawler-service/internal/repository"
+	"github.com/user/crawler-service/pkg/metrics" // Added from attempted content
 )
 
 const (
+	// These constants are now primarily used by the FailedURLRepoImpl for initial backoff,
+	// but kept here for consistency if the use case needs to reference them.
 	initialBackoff = 5 * time.Second
 	maxRetries     = 5
-	jitterFactor   = 0.2
+	jitterFactor   = 0.2 // +/- 20%
 )
 
 // Crawler defines the interface for the core crawling process.
@@ -49,38 +52,45 @@ func NewCrawlerUseCase(
 // ProcessURLFromQueue fetches a single URL from the queue and processes it.
 // It handles success by saving data and failure by scheduling a retry.
 func (uc *crawlerUseCase) ProcessURLFromQueue(ctx context.Context) error {
-	url, err := uc.queueRepo.Pop(ctx)
+	urlToCrawl, err := uc.queueRepo.Pop(ctx) // Renamed variable from 'url'
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			// Queue is empty, which is a normal state.
 			return nil
 		}
-		slog.Error("Failed to pop URL from queue", "error", err)
-		return err
+		return fmt.Errorf("failed to pop URL from queue: %w", err) // Adopted improved error wrapping
 	}
 
-	slog.Info("Processing URL from queue", "url", url)
+	slog.Info("Processing URL from queue", "url", urlToCrawl)
 
-	// For now, we hardcode sneaky mode to false. This can be extended later
-	// by storing crawl options along with the URL in the queue.
-	const useSneakyMode = false
-	extractedData, crawlErr := uc.crawlerRepo.Crawl(ctx, url, useSneakyMode)
+	startTime := time.Now()
+	parsedURL, _ := url.Parse(urlToCrawl) // Adopted from attempted content
+	domain := "unknown"
+	if parsedURL != nil {
+		domain = parsedURL.Hostname()
+	}
+
+	// For now, we default to "sneaky" mode for robustness. This could be configurable per URL.
+	const useSneakyMode = true // Adopted from attempted content
+	extractedData, crawlErr := uc.crawlerRepo.Crawl(ctx, urlToCrawl, useSneakyMode)
+
+	duration := time.Since(startTime)
+	metrics.CrawlDuration.WithLabelValues(domain).Observe(duration.Seconds()) // Adopted from attempted content
 
 	if crawlErr != nil {
-		slog.Warn("Crawling failed for URL, scheduling retry", "url", url, "error", crawlErr)
-		return uc.handleCrawlFailure(ctx, url, crawlErr)
+		slog.Error("Crawling failed for URL, scheduling retry", "url", urlToCrawl, "error", crawlErr) // Changed log level to Error
+		return uc.handleCrawlFailure(ctx, urlToCrawl, crawlErr)
 	}
 
-	slog.Info("Crawling successful for URL, saving data", "url", url)
+	slog.Info("Crawling successful for URL, saving data", "url", urlToCrawl, "duration_ms", duration.Milliseconds()) // Adopted from attempted content
 	return uc.handleCrawlSuccess(ctx, extractedData)
 }
 
 func (uc *crawlerUseCase) handleCrawlSuccess(ctx context.Context, data *entity.ExtractedData) error {
+	metrics.CrawlsTotal.WithLabelValues("success", "").Inc() // Adopted from attempted content
+
 	if err := uc.extractedDataRepo.Save(ctx, data); err != nil {
-		slog.Error("Failed to save extracted data", "url", data.URL, "error", err)
-		// If saving fails, we might want to re-queue or handle it differently.
-		// For now, we just log the error.
-		return err
+		return fmt.Errorf("failed to save extracted data for %s: %w", data.URL, err) // Adopted improved error wrapping
 	}
 
 	// If the URL was previously failed, remove it from the failed table.
@@ -93,45 +103,32 @@ func (uc *crawlerUseCase) handleCrawlSuccess(ctx context.Context, data *entity.E
 }
 
 func (uc *crawlerUseCase) handleCrawlFailure(ctx context.Context, url string, crawlErr error) error {
-	failedURL := &entity.FailedURL{
-		URL:           url,
-		FailureReason: crawlErr.Error(),
-		// HTTPStatusCode would need to be parsed from the error, which can be complex.
-		// We'll leave it as 0 for now unless the error provides it.
+	errorType := "unknown" // Adopted from attempted content
+	var httpStatusCode int // Adopted from attempted content
+	switch {
+	case errors.Is(crawlErr, repository.ErrCrawlTimeout):
+		errorType = "timeout"
+	case errors.Is(crawlErr, repository.ErrNavigationFailed):
+		errorType = "navigation"
+	case errors.Is(crawlErr, repository.ErrExtractionFailed):
+		errorType = "extraction"
+	case errors.Is(crawlErr, repository.ErrContentRestricted):
+		errorType = "restricted"
+		// Try to extract status code from error message for logging
+		fmt.Sscanf(crawlErr.Error(), "content is restricted or requires authentication: received status code %d", &httpStatusCode)
 	}
+	metrics.CrawlsTotal.WithLabelValues("failure", errorType).Inc() // Adopted from attempted content
 
-	// This is a simplified logic. A real implementation would fetch the existing record.
-	// The `SaveOrUpdate` in our postgres impl increments the count.
-	// We need to calculate the next retry time here.
-	// Let's assume we can get the current retry count from the DB or it's 0.
-	// The current `SaveOrUpdate` increments the count, so we calculate based on that.
-	// This is a bit of a chicken-and-egg problem without fetching first.
-	// Let's just calculate a default first retry time. The repo can refine this.
-	// A better way: The use case should own the retry logic.
-	// Let's simulate fetching the retry count. For now, we'll just assume it's the first failure.
-	// A proper implementation would be:
-	// 1. failedRecord, err := failedURLRepo.FindByURL(ctx, url)
-	// 2. if err == pgx.ErrNoRows -> new record, retryCount = 0
-	// 3. else -> existing record, retryCount = failedRecord.RetryCount
-
-	// Simplified logic for this step:
-	retryCount := 0 // Assume we would fetch this. The DB ON CONFLICT will increment it.
-	if retryCount >= maxRetries {
-		slog.Warn("URL has reached max retries, marking as permanently failed", "url", url)
-		// Set NextRetryAt to null or a far-future date to stop retrying.
-		// For now, we just won't schedule a new retry.
-		failedURL.NextRetryAt = time.Time{} // Or a specific sentinel value
-	} else {
-		backoff := initialBackoff * time.Duration(math.Pow(2, float64(retryCount)))
-		jitter := time.Duration(rand.Float64()*jitterFactor*float64(backoff)) * (time.Duration(rand.Intn(2)*2 - 1))
-		nextRetry := time.Now().Add(backoff + jitter)
-		failedURL.NextRetryAt = nextRetry
-		slog.Info("Scheduling retry for failed URL", "url", url, "next_retry_at", nextRetry)
+	failedURL := &entity.FailedURL{
+		URL:                  url,
+		FailureReason:        crawlErr.Error(),
+		HTTPStatusCode:       httpStatusCode,       // Adopted from attempted content
+		LastAttemptTimestamp: time.Now(),           // Adopted from attempted content
+		// NextRetryAt is now handled by the repository's SaveOrUpdate method
 	}
 
 	if err := uc.failedURLRepo.SaveOrUpdate(ctx, failedURL); err != nil {
-		slog.Error("Failed to save failed URL record", "url", url, "error", err)
-		return err
+		return fmt.Errorf("failed to save or update failed URL record for %s: %w", url, err) // Adopted improved error wrapping
 	}
 
 	return nil

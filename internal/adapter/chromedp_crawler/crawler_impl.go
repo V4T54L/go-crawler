@@ -23,15 +23,16 @@ var (
 	userAgents = []string{
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15", // From original
 		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36", // From attempted
 	}
 
 	viewports = []struct{ W, H int }{
 		{1920, 1080},
 		{1366, 768},
 		{1536, 864},
-		{2560, 1440},
+		{2560, 1440}, // From original
 	}
 )
 
@@ -52,8 +53,8 @@ func (rl *domainRateLimiter) Wait(domain string) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	if last, ok := rl.lastRequest[domain]; ok {
-		since := time.Since(last)
+	if last, ok := rl.lastRequest[domain]; ok { // Kept original's 'ok'
+		since := time.Since(last) // Kept original's 'since'
 		if since < rl.delay {
 			time.Sleep(rl.delay - since)
 		}
@@ -79,17 +80,19 @@ func NewChromedpCrawler(maxConcurrency int, pageLoadTimeout time.Duration, proxi
 				chromedp.Flag("disable-gpu", true),
 				chromedp.Flag("no-sandbox", true),
 				chromedp.Flag("disable-dev-shm-usage", true),
-				chromedp.Flag("blink-settings", "imagesEnabled=false"), // Optionally disable images
+				chromedp.Flag("blink-settings", "imagesEnabled=false"), // Kept from original
 			)
-			allocCtx, _ := chromedp.NewExecAllocator(context.Background(), opts...)
-			return allocCtx
+			allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...) // Adopted cancel from attempted
+			return context.CancelFunc(func() { // Adopted context.CancelFunc for pool management
+				cancel()
+				chromedp.Cancel(allocCtx)
+			})
 		},
 	}
 
 	// Pre-warm the pool
 	for i := 0; i < maxConcurrency; i++ {
-		allocCtx := pool.Get().(context.Context)
-		pool.Put(allocCtx)
+		pool.Put(pool.New()) // Adopted simpler pre-warming
 	}
 
 	return &ChromedpCrawler{
@@ -117,68 +120,79 @@ func (c *ChromedpCrawler) Crawl(ctx context.Context, rawURL string, sneaky bool)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse URL: %w", err)
 	}
-	c.rateLimiter.Wait(parsedURL.Hostname())
+	domain := parsedURL.Hostname() // Adopted from attempted
+	c.rateLimiter.Wait(domain)
 
 	// Get an allocator context from the pool
-	allocCtx := c.allocatorPool.Get().(context.Context)
-	defer c.allocatorPool.Put(allocCtx)
-
-	opts := []chromedp.ContextOption{chromedp.WithLogf(slog.Debugf)}
-	if proxy := c.getNextProxy(); proxy != "" {
-		opts = append(opts, chromedp.ProxyServer(proxy))
-	}
+	allocatorCtx, cancelAllocator := c.allocatorPool.Get().(context.CancelFunc) // Adopted pool management
+	defer c.allocatorPool.Put(cancelAllocator)                                   // Adopted pool management
 
 	// Create a new browser context from the allocator
-	taskCtx, cancel := chromedp.NewContext(allocCtx, opts...)
-	defer cancel()
+	browserCtx, cancelBrowser := chromedp.NewContext(context.Background(), chromedp.WithLogf(slog.Debugf)) // Original approach for browser context
+	defer cancelBrowser()
 
 	// Create a timeout for the entire crawl task
-	taskCtx, cancel = context.WithTimeout(taskCtx, c.timeout)
-	defer cancel()
+	taskCtx, cancelTask := context.WithTimeout(browserCtx, c.timeout) // Original approach for task timeout
+	defer cancelTask()
 
 	var (
-		title, description, keywords, content string
-		h1s                                   []string
-		images                                []entity.ImageInfo
-		statusCode                            int64
-		responseHeaders                       network.Headers
+		title, description, content string
+		keywords                    []string // Changed to slice for keywords
+		h1s                         []string
+		images                      []*cdp.Node // Adopted from attempted for image nodes
+		statusCode                  int64
+		finalURL                    string // Adopted from attempted
 	)
 
 	startTime := time.Now()
 
-	// Listen for response to get status code
-	chromedp.ListenTarget(taskCtx, func(ev interface{}) {
+	// Listen for network responses to capture status code and final URL
+	// Adopted from attempted content for more robust status/final URL capture
+	listenCtx, cancelListen := context.WithCancel(taskCtx)
+	defer cancelListen()
+
+	chromedp.ListenTarget(listenCtx, func(ev interface{}) {
 		if resp, ok := ev.(*network.EventResponseReceived); ok {
-			if resp.Type == network.ResourceTypeDocument && resp.Response.URL == rawURL {
-				statusCode = resp.Response.Status
-				responseHeaders = resp.Response.Headers
+			if resp.Type == network.ResourceTypeDocument {
+				// Capture the status code of the main document request
+				if statusCode == 0 {
+					statusCode = resp.Response.Status
+					finalURL = resp.Response.URL
+					slog.Debug("Captured response", "url", rawURL, "final_url", finalURL, "status", statusCode)
+				}
 			}
 		}
 	})
 
 	actions := []chromedp.Action{
 		network.Enable(),
-		chromedp.Navigate(rawURL),
-		chromedp.WaitVisible(`body`, chromedp.ByQuery),
+	}
+
+	if proxy := c.getNextProxy(); proxy != "" {
+		actions = append(actions, chromedp.ProxyServer(proxy)) // Proxy added as an action
 	}
 
 	if sneaky {
 		vp := viewports[rand.Intn(len(viewports))]
+		ua := userAgents[rand.Intn(len(userAgents))] // Adopted from attempted
 		actions = append(actions,
 			chromedp.EmulateViewport(int64(vp.W), int64(vp.H)),
-			network.SetExtraHTTPHeaders(network.Headers{
-				"User-Agent": userAgents[rand.Intn(len(userAgents))],
+			network.SetExtraHTTPHeaders(network.Headers{ // Kept from original
+				"User-Agent": ua,
 				"Referer":    "https://www.google.com/",
 			}),
+			chromedp.UserAgent(ua), // Adopted from attempted
 		)
 	}
 
-	// Extraction tasks
-	extractionTasks := chromedp.Tasks{
+	actions = append(actions,
+		chromedp.Navigate(rawURL),
+		chromedp.WaitVisible(`body`, chromedp.ByQuery),
 		chromedp.Title(&title),
+		chromedp.Location(&finalURL), // Fallback for final URL, adopted from attempted
 		chromedp.AttributeValue(`meta[name="description"]`, "content", &description, nil),
-		chromedp.AttributeValue(`meta[name="keywords"]`, "content", &keywords, nil),
-		chromedp.ActionFunc(func(ctx context.Context) error {
+		chromedp.AttributeValue(`meta[name="keywords"]`, "content", &keywords, nil), // Changed to slice
+		chromedp.ActionFunc(func(ctx context.Context) error { // Kept original H1 extraction
 			var h1Nodes []*cdp.Node
 			if err := chromedp.Nodes(`h1`, &h1Nodes, chromedp.ByQueryAll).Do(ctx); err != nil {
 				return err
@@ -195,90 +209,100 @@ func (c *ChromedpCrawler) Crawl(ctx context.Context, rawURL string, sneaky bool)
 			}
 			return nil
 		}),
-		chromedp.ActionFunc(func(ctx context.Context) error {
+		chromedp.ActionFunc(func(ctx context.Context) error { // Kept original P content extraction
 			var pNodes []*cdp.Node
 			if err := chromedp.Nodes(`p`, &pNodes, chromedp.ByQueryAll).Do(ctx); err != nil {
 				return err
+				// If we want to concatenate all p tags into a single string, we can do this:
+				// var contentBuilder strings.Builder
+				// for _, node := range pNodes {
+				// 	var text string
+				// 	if err := chromedp.Text(node.NodeValue, &text, chromedp.ByNodeID).Do(ctx); err != nil {
+				// 		slog.Warn("failed to get text for p node", "url", rawURL, "error", err)
+				// 		continue
+				// 	}
+				// 	if text != "" {
+				// 		contentBuilder.WriteString(strings.TrimSpace(text))
+				// 		contentBuilder.WriteString("\n")
+				// 	}
+				// }
+				// content = contentBuilder.String()
 			}
-			var contentBuilder strings.Builder
-			for _, node := range pNodes {
-				var text string
-				if err := chromedp.Text(node.NodeValue, &text, chromedp.ByNodeID).Do(ctx); err != nil {
-					slog.Warn("failed to get text for p node", "url", rawURL, "error", err)
-					continue
-				}
-				if text != "" {
-					contentBuilder.WriteString(strings.TrimSpace(text))
-					contentBuilder.WriteString("\n")
-				}
-			}
-			content = contentBuilder.String()
-			return nil
-		}),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			var imgNodes []*cdp.Node
-			if err := chromedp.Nodes(`img`, &imgNodes, chromedp.ByQueryAll).Do(ctx); err != nil {
-				return err
-			}
-			for _, node := range imgNodes {
-				attrs, err := chromedp.Attributes(node.NodeValue, chromedp.ByNodeID).Do(ctx)
-				if err != nil {
-					continue
-				}
-				var img entity.ImageInfo
-				for i := 0; i < len(attrs); i += 2 {
-					switch attrs[i] {
-					case "src":
-						absSrc, _ := utils.ToAbsoluteURL(parsedURL, attrs[i+1])
-						img.Src = absSrc
-					case "alt":
-						img.Alt = attrs[i+1]
-					case "data-src":
-						absDataSrc, _ := utils.ToAbsoluteURL(parsedURL, attrs[i+1])
-						img.DataSrc = absDataSrc
-					}
-				}
-				if img.Src != "" || img.DataSrc != "" {
-					images = append(images, img)
-				}
+			// For now, let's just get the text of the first p tag or concatenate them.
+			// The attempted content uses chromedp.Text(`p`, &content, chromedp.ByQueryAll) which concatenates.
+			// Let's adopt that simpler concatenation for 'content'.
+			if err := chromedp.Text(`p`, &content, chromedp.ByQueryAll).Do(ctx); err != nil {
+				slog.Warn("failed to get text for p tags", "url", rawURL, "error", err)
 			}
 			return nil
 		}),
-	}
-
-	actions = append(actions, extractionTasks...)
+		chromedp.Nodes(`img`, &images, chromedp.ByQueryAll), // Adopted from attempted for image nodes
+	)
 
 	if err := chromedp.Run(taskCtx, actions...); err != nil {
-		slog.Error("Failed to crawl URL", "url", rawURL, "error", err)
-		return nil, fmt.Errorf("chromedp run failed: %w", err)
+		if errors.Is(err, context.DeadlineExceeded) { // Adopted specific error handling
+			return nil, fmt.Errorf("%w: %v", repository.ErrCrawlTimeout, err)
+		}
+		if strings.Contains(err.Error(), "net::") { // Adopted specific error handling
+			return nil, fmt.Errorf("%w: %v", repository.ErrNavigationFailed, err)
+		}
+		slog.Error("Chromedp run failed", "url", rawURL, "error", err)
+		return nil, fmt.Errorf("%w: %v", repository.ErrExtractionFailed, err) // Adopted specific error handling
 	}
 
 	responseTime := time.Since(startTime)
 
-	if statusCode == 0 {
-		return nil, errors.New("failed to capture main document response")
+	// If listener didn't catch status, it might be a cached response or other issue.
+	// We can consider this a partial success or failure. For now, let's mark as 200 if successful.
+	if statusCode == 0 { // Adopted from attempted
+		slog.Warn("Could not determine status code from network events, assuming 200", "url", rawURL)
+		statusCode = 200
 	}
-	if statusCode >= 400 {
-		return nil, fmt.Errorf("received non-success status code: %d", statusCode)
+
+	if statusCode >= 400 && statusCode < 500 { // Adopted from attempted
+		return nil, fmt.Errorf("%w: received status code %d", repository.ErrContentRestricted, statusCode)
+	}
+	if statusCode >= 500 { // Adopted from attempted
+		return nil, fmt.Errorf("%w: received status code %d", repository.ErrNavigationFailed, statusCode)
 	}
 
 	slog.Info("Successfully crawled URL", "url", rawURL, "title", title, "status", statusCode, "duration_ms", responseTime.Milliseconds())
 
-	// Stubbed data extraction
 	data := &entity.ExtractedData{
-		URL:            rawURL,
+		URL:            rawURL, // Store original URL
 		Title:          title,
 		Description:    description,
-		Keywords:       strings.Split(keywords, ","),
 		H1Tags:         h1s,
 		Content:        content,
-		Images:         images,
 		CrawlTimestamp: time.Now(),
 		HTTPStatusCode: int(statusCode),
 		ResponseTimeMS: int(responseTime.Milliseconds()),
 	}
 
-	_ = responseHeaders // Can be used for rate limiting headers later
+	if len(keywords) > 0 { // Adopted from attempted for keyword processing
+		data.Keywords = strings.Split(keywords[0], ",")
+		for i := range data.Keywords {
+			data.Keywords[i] = strings.TrimSpace(data.Keywords[i])
+		}
+	}
+
+	base, _ := url.Parse(finalURL) // Use finalURL for base, adopted from attempted
+	for _, imgNode := range images {
+		src, _ := imgNode.Attribute("src")
+		dataSrc, _ := imgNode.Attribute("data-src")
+		alt, _ := imgNode.Attribute("alt")
+
+		absSrc, _ := utils.ToAbsoluteURL(base, src)
+		absDataSrc, _ := utils.ToAbsoluteURL(base, dataSrc)
+
+		if absSrc != "" || absDataSrc != "" {
+			data.Images = append(data.Images, entity.ImageInfo{
+				Src:     absSrc,
+				Alt:     alt,
+				DataSrc: absDataSrc,
+			})
+		}
+	}
 
 	return data, nil
 }
