@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -22,6 +23,11 @@ func NewHandler(urlManager usecase.URLManager) *Handler {
 }
 
 func (h *Handler) HandleSubmitCrawl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		h.writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var req request.SubmitCrawlRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.writeJSONError(w, "Invalid request body", http.StatusBadRequest)
@@ -35,7 +41,7 @@ func (h *Handler) HandleSubmitCrawl(w http.ResponseWriter, r *http.Request) {
 
 	crawlID, err := h.urlManager.Submit(r.Context(), req.URL, req.ForceCrawl)
 	if err != nil {
-		if err == usecase.ErrURLRecentlyCrawled {
+		if errors.Is(err, usecase.ErrURLRecentlyCrawled) {
 			h.writeJSONError(w, err.Error(), http.StatusConflict)
 			return
 		}
@@ -46,22 +52,32 @@ func (h *Handler) HandleSubmitCrawl(w http.ResponseWriter, r *http.Request) {
 
 	resp := response.SubmitCrawlResponse{
 		Status:         "success",
-		Message:        "URL submitted for crawling.",
+		Message:        "URL submitted for crawling",
 		CrawlRequestID: crawlID,
 	}
 	h.writeJSON(w, http.StatusAccepted, resp)
 }
 
 func (h *Handler) HandleGetCrawlStatus(w http.ResponseWriter, r *http.Request) {
-	urlParam := r.URL.Query().Get("url")
-	if urlParam == "" {
+	if r.Method != http.MethodGet {
+		h.writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rawURL := r.URL.Query().Get("url")
+	if rawURL == "" {
 		h.writeJSONError(w, "URL query parameter is required", http.StatusBadRequest)
 		return
 	}
 
-	status, err := h.urlManager.GetStatus(r.Context(), urlParam)
+	if _, err := url.ParseRequestURI(rawURL); err != nil {
+		h.writeJSONError(w, "Invalid URL format in query parameter", http.StatusBadRequest)
+		return
+	}
+
+	status, err := h.urlManager.GetStatus(r.Context(), rawURL)
 	if err != nil {
-		slog.Error("Failed to get crawl status", "url", urlParam, "error", err)
+		slog.Error("Failed to get crawl status", "url", rawURL, "error", err)
 		h.writeJSONError(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -71,12 +87,19 @@ func (h *Handler) HandleGetCrawlStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.writeJSON(w, http.StatusOK, status)
+	resp := response.CrawlStatusResponse{
+		URL:                status.URL,
+		CurrentStatus:      status.CurrentStatus,
+		LastCrawlTimestamp: status.LastCrawlTimestamp,
+		NextRetryAt:        status.NextRetryAt,
+		FailureReason:      status.FailureReason,
+	}
+
+	h.writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) HandleHealthCheck(w http.ResponseWriter, r *http.Request) {
-	resp := map[string]string{"status": "ok"}
-	h.writeJSON(w, http.StatusOK, resp)
+	h.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (h *Handler) writeJSON(w http.ResponseWriter, status int, data interface{}) {

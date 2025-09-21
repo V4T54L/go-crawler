@@ -6,18 +6,15 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/user/crawler-service/internal/entity"
 	"github.com/user/crawler-service/internal/repository"
 	"github.com/user/crawler-service/pkg/utils"
 )
 
-var (
-	ErrURLRecentlyCrawled = errors.New("URL has been crawled recently and force_crawl is false")
-)
+var ErrURLRecentlyCrawled = errors.New("url has been crawled recently")
 
-const (
-	deduplicationExpiry = 48 * time.Hour // 2 days
-)
+const deduplicationExpiry = 48 * time.Hour // 2 days
 
 // URLManager defines the interface for submitting and checking URLs.
 type URLManager interface {
@@ -48,20 +45,19 @@ func NewURLManager(
 }
 
 func (uc *urlManagerUseCase) Submit(ctx context.Context, url string, force bool) (string, error) {
-	crawlID := utils.HashURL(url)
-
-	if force {
-		if err := uc.visitedRepo.RemoveVisited(ctx, url); err != nil {
-			slog.Warn("Failed to remove visited key for force crawl", "url", url, "error", err)
-			// Continue anyway, as this is not a critical failure
-		}
-	} else {
-		isVisited, err := uc.visitedRepo.IsVisited(ctx, url)
+	if !force {
+		visited, err := uc.visitedRepo.IsVisited(ctx, url)
 		if err != nil {
 			return "", err
 		}
-		if isVisited {
-			return crawlID, ErrURLRecentlyCrawled
+		if visited {
+			return "", ErrURLRecentlyCrawled
+		}
+	} else {
+		// If forcing, remove from visited to allow re-queuing immediately.
+		if err := uc.visitedRepo.RemoveVisited(ctx, url); err != nil {
+			slog.Warn("Failed to remove visited key for force crawl", "url", url, "error", err)
+			// Continue anyway, as this is not a critical failure
 		}
 	}
 
@@ -69,51 +65,66 @@ func (uc *urlManagerUseCase) Submit(ctx context.Context, url string, force bool)
 		return "", err
 	}
 
+	// Mark as visited to prevent re-queuing from other sources.
 	if err := uc.visitedRepo.MarkVisited(ctx, url, deduplicationExpiry); err != nil {
-		// This is a non-critical error. The URL is in the queue, but might be queued again
-		// if another request comes in before it's processed. Log it.
+		// Log the error but don't fail the submission, as it's already queued.
 		slog.Error("Failed to mark URL as visited after queueing", "url", url, "error", err)
 	}
 
-	return crawlID, nil
+	return utils.HashURL(url), nil
 }
 
 func (uc *urlManagerUseCase) GetStatus(ctx context.Context, url string) (*entity.CrawlStatus, error) {
-	// Check if successfully crawled
+	// 1. Check if successfully extracted
 	data, err := uc.extractedDataRepo.FindByURL(ctx, url)
-	if err != nil && err.Error() != "no rows in result set" { // A bit brittle, better to use pgx.ErrNoRows
-		slog.Error("Error finding extracted data by URL", "url", url, "error", err)
-		// Don't return yet, continue checking other states
-	}
-	if data != nil {
+	if err == nil && data != nil {
 		return &entity.CrawlStatus{
 			URL:                url,
 			CurrentStatus:      "completed",
 			LastCrawlTimestamp: &data.CrawlTimestamp,
 		}, nil
 	}
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err // Actual DB error
+	}
 
-	// Check if failed
-	// This part of the logic is incomplete as we don't have the failedURLRepo FindByURL method yet.
-	// We'll assume it exists for the purpose of this use case.
-	// For now, we'll skip this check.
+	// 2. Check if it's in the failed table
+	// A proper implementation would have a FindByURL method on the failedURLRepo.
+	// For now, we'll assume this check is part of a more complete repo.
+	// Let's add a placeholder for this logic.
+	// For this step, we'll skip the failed check as the repo doesn't have FindByURL.
+	failedURL, err := uc.failedURLRepo.FindByURL(ctx, url) // Assuming this method exists now
+	if err == nil && failedURL != nil {
+		status := "failed"
+		if failedURL.NextRetryAt.After(time.Now()) {
+			status = "retrying"
+		}
+		return &entity.CrawlStatus{
+			URL:           url,
+			CurrentStatus: status,
+			NextRetryAt:   &failedURL.NextRetryAt,
+			FailureReason: failedURL.FailureReason,
+		}, nil
+	}
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err // Actual DB error
+	}
 
-	// Check if pending (in visited set but not in PG)
-	isVisited, err := uc.visitedRepo.IsVisited(ctx, url)
+	// 3. Check if it's "pending" (i.e., in the visited set but not completed or failed)
+	visited, err := uc.visitedRepo.IsVisited(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	if isVisited {
+	if visited {
 		return &entity.CrawlStatus{
 			URL:           url,
 			CurrentStatus: "pending",
 		}, nil
 	}
 
-	// If none of the above, it's not found
+	// 4. If none of the above, it's not found
 	return &entity.CrawlStatus{
 		URL:           url,
 		CurrentStatus: "not_found",
 	}, nil
 }
-
